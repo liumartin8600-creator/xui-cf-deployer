@@ -10,6 +10,7 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import time
 import uuid
 from getpass import getpass
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -29,6 +30,8 @@ PROTOCOL_SUFFIX = {"vless": "vl", "trojan": "tr", "vmess": "vm"}
 PROTOCOL_LABEL = {"vless": "VLESS", "trojan": "TROJAN", "vmess": "VMESS"}
 PROTOCOL_QUERY_FLAG = {"vless": "ev", "trojan": "et", "vmess": "evm"}
 MANAGED_RULE_PREFIX = "3x-ui-auto "
+MANAGED_TAG_RE = re.compile(r"^([0-9a-f]{8})-(vless|trojan|vmess)$", re.I)
+CLIENT_EMAIL_DOMAIN = "cf-auto.local"
 PANEL_API_PREFIX = "panel/api"
 BACKEND_DB = "db"
 BACKEND_API = "api"
@@ -767,7 +770,317 @@ def apply_origin_rules(
     put_origin_rules(zone_id, headers, next_rules)
 
 
-def protocol_settings(protocol: str, user_uuid: str) -> Dict[str, Any]:
+def client_email_for_route(short_id: str, protocol: str) -> str:
+    return f"{short_id.lower()}-{protocol.lower()}@{CLIENT_EMAIL_DOMAIN}"
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    )
+    return cursor.fetchone() is not None
+
+
+def has_v3_client_schema(conn: sqlite3.Connection) -> bool:
+    return table_exists(conn, "clients") and table_exists(conn, "client_inbounds")
+
+
+def inbound_client_entry(protocol: str, user_uuid: str, email: str) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "email": email,
+        "limitIp": 0,
+        "totalGB": 0,
+        "expiryTime": 0,
+        "enable": True,
+        "tgId": "",
+        "subId": "",
+        "reset": 0,
+        "flow": "",
+    }
+    if protocol == "vless":
+        entry["id"] = user_uuid
+    elif protocol == "trojan":
+        entry["password"] = user_uuid
+    elif protocol == "vmess":
+        entry["id"] = user_uuid
+        entry["alterId"] = 0
+        entry["security"] = "auto"
+    else:
+        raise ValueError(f"不支持的协议: {protocol}")
+    return entry
+
+
+def protocol_settings(protocol: str, user_uuid: str, email: str) -> Dict[str, Any]:
+    client = inbound_client_entry(protocol, user_uuid, email)
+    if protocol == "vless":
+        return {
+            "clients": [client],
+            "decryption": "none",
+            "fallbacks": [],
+        }
+    if protocol == "trojan":
+        return {
+            "clients": [client],
+            "fallbacks": [],
+        }
+    if protocol == "vmess":
+        return {
+            "clients": [client],
+        }
+    raise ValueError(f"不支持的协议: {protocol}")
+
+
+def parse_inbound_client_from_settings(protocol: str, settings_text: str) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(settings_text or "{}")
+    except json.JSONDecodeError:
+        return None
+    clients = payload.get("clients")
+    if not isinstance(clients, list) or not clients:
+        return None
+    first = clients[0]
+    return first if isinstance(first, dict) else None
+
+
+def client_email_from_tag(tag: str) -> Optional[str]:
+    match = MANAGED_TAG_RE.match(tag or "")
+    if not match:
+        return None
+    short_id, protocol = match.group(1), match.group(2).lower()
+    return client_email_for_route(short_id, protocol)
+
+
+def upsert_v3_client_record(
+    cursor: sqlite3.Cursor,
+    protocol: str,
+    user_uuid: str,
+    email: str,
+    ts_ms: int,
+) -> int:
+    uuid_val = user_uuid if protocol in ("vless", "vmess") else ""
+    password_val = user_uuid if protocol == "trojan" else ""
+    security_val = "auto" if protocol == "vmess" else ""
+
+    cursor.execute("SELECT id FROM clients WHERE email = ?", (email,))
+    row = cursor.fetchone()
+    if row:
+        client_id = int(row[0])
+        cursor.execute(
+            """
+            UPDATE clients
+            SET uuid=?, password=?, flow='', security=?, limit_ip=0, total_gb=0,
+                expiry_time=0, enable=1, tg_id=0, comment='', reset=0, updated_at=?
+            WHERE id=?
+            """,
+            (uuid_val, password_val, security_val, ts_ms, client_id),
+        )
+        return client_id
+
+    cursor.execute(
+        """
+        INSERT INTO clients (
+            email, sub_id, uuid, password, auth, flow, security, reverse,
+            limit_ip, total_gb, expiry_time, enable, tg_id, group_name, comment, reset,
+            created_at, updated_at
+        ) VALUES (?, '', ?, ?, '', '', ?, '', 0, 0, 0, 1, 0, '', '', 0, ?, ?)
+        """,
+        (email, uuid_val, password_val, security_val, ts_ms, ts_ms),
+    )
+    return int(cursor.lastrowid)
+
+
+def link_v3_client_inbound(
+    cursor: sqlite3.Cursor,
+    client_id: int,
+    inbound_id: int,
+    ts_ms: int,
+    flow: str = "",
+) -> None:
+    cursor.execute("DELETE FROM client_inbounds WHERE inbound_id = ?", (inbound_id,))
+    cursor.execute(
+        """
+        INSERT INTO client_inbounds (client_id, inbound_id, flow_override, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (client_id, inbound_id, flow, ts_ms),
+    )
+
+
+def ensure_v3_client_traffic(cursor: sqlite3.Cursor, conn: sqlite3.Connection, inbound_id: int, email: str) -> None:
+    if not table_exists(conn, "client_traffics"):
+        return
+    cursor.execute("SELECT 1 FROM client_traffics WHERE email = ? LIMIT 1", (email,))
+    if cursor.fetchone():
+        cursor.execute(
+            """
+            UPDATE client_traffics
+            SET inbound_id=?, enable=1, total=0, expiry_time=0, reset=0
+            WHERE email=?
+            """,
+            (inbound_id, email),
+        )
+        return
+    cursor.execute(
+        """
+        INSERT INTO client_traffics (
+            inbound_id, enable, email, up, down, expiry_time, total, reset, last_online
+        ) VALUES (?, 1, ?, 0, 0, 0, 0, 0, 0)
+        """,
+        (inbound_id, email),
+    )
+
+
+def sync_v3_client_for_inbound(
+    conn: sqlite3.Connection,
+    inbound_id: int,
+    protocol: str,
+    user_uuid: str,
+    email: str,
+    ts_ms: Optional[int] = None,
+) -> None:
+    if not has_v3_client_schema(conn):
+        return
+    ts = ts_ms if ts_ms is not None else now_ms()
+    cursor = conn.cursor()
+    client_id = upsert_v3_client_record(cursor, protocol, user_uuid, email, ts)
+    link_v3_client_inbound(cursor, client_id, inbound_id, ts)
+    ensure_v3_client_traffic(cursor, conn, inbound_id, email)
+
+
+def extract_client_uuid(protocol: str, client: Dict[str, Any]) -> str:
+    if protocol == "trojan":
+        return str(client.get("password") or "")
+    return str(client.get("id") or "")
+
+
+def repair_v3_missing_client_bindings(
+    db_path: str,
+    inbound_ids: Optional[List[int]] = None,
+) -> int:
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.Error:
+        return 0
+
+    try:
+        if not has_v3_client_schema(conn):
+            return 0
+
+        cursor = conn.cursor()
+        if inbound_ids:
+            placeholders = ",".join(["?"] * len(inbound_ids))
+            cursor.execute(
+                f"""
+                SELECT id, tag, protocol, settings
+                FROM inbounds
+                WHERE id IN ({placeholders})
+                  AND protocol IN ('vless', 'trojan', 'vmess')
+                """,
+                inbound_ids,
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT id, tag, protocol, settings
+                FROM inbounds
+                WHERE protocol IN ('vless', 'trojan', 'vmess')
+                """
+            )
+
+        repaired = 0
+        ts_ms = now_ms()
+        for inbound_id, tag, protocol, settings_text in cursor.fetchall():
+            inbound_id = int(inbound_id)
+            protocol = str(protocol)
+            cursor.execute(
+                "SELECT COUNT(*) FROM client_inbounds WHERE inbound_id = ?",
+                (inbound_id,),
+            )
+            if int(cursor.fetchone()[0]) > 0:
+                continue
+
+            client = parse_inbound_client_from_settings(protocol, str(settings_text or ""))
+            if client is None:
+                continue
+
+            email = str(client.get("email") or "").strip()
+            if not email:
+                email = client_email_from_tag(str(tag or "")) or ""
+            if not email:
+                continue
+
+            user_uuid = extract_client_uuid(protocol, client)
+            if not user_uuid:
+                continue
+
+            if not str(client.get("email") or "").strip():
+                payload = json.loads(settings_text or "{}")
+                clients = payload.get("clients")
+                if isinstance(clients, list) and clients and isinstance(clients[0], dict):
+                    clients[0]["email"] = email
+                    payload["clients"] = clients
+                    cursor.execute(
+                        "UPDATE inbounds SET settings=? WHERE id=?",
+                        (json.dumps(payload, separators=(",", ":")), inbound_id),
+                    )
+
+            sync_v3_client_for_inbound(conn, inbound_id, protocol, user_uuid, email, ts_ms)
+            repaired += 1
+
+        if repaired:
+            conn.commit()
+        return repaired
+    except sqlite3.Error as e:
+        print(str(e))
+        sys.exit(1)
+    finally:
+        conn.close()
+
+
+def cleanup_v3_clients_for_inbounds(conn: sqlite3.Connection, inbound_ids: List[int]) -> None:
+    if not inbound_ids or not has_v3_client_schema(conn):
+        return
+
+    cursor = conn.cursor()
+    placeholders = ",".join(["?"] * len(inbound_ids))
+    cursor.execute(
+        f"""
+        SELECT DISTINCT c.email
+        FROM clients c
+        JOIN client_inbounds ci ON ci.client_id = c.id
+        WHERE ci.inbound_id IN ({placeholders})
+        """,
+        inbound_ids,
+    )
+    emails = [str(row[0]) for row in cursor.fetchall() if row and row[0]]
+
+    cursor.execute(f"DELETE FROM client_inbounds WHERE inbound_id IN ({placeholders})", inbound_ids)
+
+    for email in emails:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM client_inbounds ci
+            JOIN clients c ON c.id = ci.client_id
+            WHERE c.email = ?
+            """,
+            (email,),
+        )
+        if int(cursor.fetchone()[0]) > 0:
+            continue
+        cursor.execute("DELETE FROM clients WHERE email = ?", (email,))
+        if table_exists(conn, "client_traffics"):
+            cursor.execute("DELETE FROM client_traffics WHERE email = ?", (email,))
+
+
+def protocol_settings_legacy(protocol: str, user_uuid: str) -> Dict[str, Any]:
+    """旧版 3x-ui：clients 嵌在 settings 内，email 可为空。"""
     if protocol == "vless":
         return {
             "clients": [{"id": user_uuid, "flow": "", "email": ""}],
@@ -793,15 +1106,17 @@ def normalize_existing_inbound_client_email(db_path: str) -> None:
         exit_error(str(e))
 
     try:
+        v3_schema = has_v3_client_schema(conn)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, settings FROM inbounds WHERE protocol IN ('vless','trojan','vmess')"
+            "SELECT id, tag, settings FROM inbounds WHERE protocol IN ('vless','trojan','vmess')"
         )
         rows = cursor.fetchall()
         changed: List[tuple[str, int]] = []
         for row in rows:
             inbound_id = int(row[0])
-            settings_text = str(row[1] or "")
+            tag = str(row[1] or "")
+            settings_text = str(row[2] or "")
             try:
                 payload = json.loads(settings_text or "{}")
             except json.JSONDecodeError:
@@ -814,6 +1129,13 @@ def normalize_existing_inbound_client_email(db_path: str) -> None:
             for client in clients:
                 if not isinstance(client, dict):
                     continue
+                email = str(client.get("email") or "").strip()
+                if not email and v3_schema:
+                    derived = client_email_from_tag(tag)
+                    if derived:
+                        client["email"] = derived
+                        updated = True
+                        continue
                 if client.get("email") is None:
                     client["email"] = ""
                     updated = True
@@ -832,6 +1154,29 @@ def normalize_existing_inbound_client_email(db_path: str) -> None:
         sys.exit(1)
     finally:
         conn.close()
+
+
+def maybe_repair_v3_client_bindings(
+    db_path: str,
+    mode: str,
+    state: Optional[Dict[str, Any]] = None,
+) -> None:
+    if mode == "uninstall" or not os.path.exists(db_path):
+        return
+    inbound_ids: Optional[List[int]] = None
+    if state and isinstance(state.get("inbound_ids"), list):
+        parsed: List[int] = []
+        for item in state["inbound_ids"]:
+            try:
+                parsed.append(int(item))
+            except Exception:
+                continue
+        if parsed:
+            inbound_ids = parsed
+    repaired = repair_v3_missing_client_bindings(db_path, inbound_ids)
+    if repaired:
+        print(f"已修复 {repaired} 个 3x-ui v3 入站客户端绑定")
+        restart_xui_service()
 
 
 def ws_stream_settings(path: str) -> Dict[str, Any]:
@@ -856,6 +1201,7 @@ def allocate_settings() -> Dict[str, Any]:
 
 
 def build_inbound_payload(protocol: str, user_uuid: str, short_id: str, route: Dict[str, Any]) -> Dict[str, Any]:
+    email = client_email_for_route(short_id, protocol)
     return {
         "enable": True,
         "remark": f"{short_id}-{protocol}",
@@ -864,7 +1210,7 @@ def build_inbound_payload(protocol: str, user_uuid: str, short_id: str, route: D
         "protocol": protocol,
         "expiryTime": 0,
         "tag": f"{short_id}-{protocol}",
-        "settings": json.dumps(protocol_settings(protocol, user_uuid), separators=(",", ":")),
+        "settings": json.dumps(protocol_settings(protocol, user_uuid, email), separators=(",", ":")),
         "streamSettings": json.dumps(ws_stream_settings(route["path"]), separators=(",", ":")),
         "sniffing": json.dumps(sniffing_settings(), separators=(",", ":")),
     }
@@ -995,9 +1341,17 @@ def insert_inbounds_db(
         template = load_template_inbound(conn)
         cursor = conn.cursor()
         inserted_ids: List[int] = []
+        v3_schema = has_v3_client_schema(conn)
+        ts_ms = now_ms()
 
         for route in routes:
             protocol = route["protocol"]
+            email = client_email_for_route(short_id, protocol)
+            settings = (
+                protocol_settings(protocol, user_uuid, email)
+                if v3_schema
+                else protocol_settings_legacy(protocol, user_uuid)
+            )
             row_data = dict(template)
             row_data.update(
                 {
@@ -1010,7 +1364,7 @@ def insert_inbounds_db(
                     "listen": "",
                     "port": route["port"],
                     "protocol": protocol,
-                    "settings": json.dumps(protocol_settings(protocol, user_uuid), separators=(",", ":")),
+                    "settings": json.dumps(settings, separators=(",", ":")),
                     "stream_settings": json.dumps(ws_stream_settings(route["path"]), separators=(",", ":")),
                     "sniffing": json.dumps(sniffing_settings(), separators=(",", ":")),
                     "allocate": json.dumps(allocate_settings(), separators=(",", ":")),
@@ -1035,7 +1389,10 @@ def insert_inbounds_db(
             placeholders = ",".join(["?"] * len(columns))
             sql = f"INSERT INTO inbounds ({','.join(columns)}) VALUES ({placeholders})"
             cursor.execute(sql, values)
-            inserted_ids.append(int(cursor.lastrowid))
+            inbound_id = int(cursor.lastrowid)
+            inserted_ids.append(inbound_id)
+            if v3_schema:
+                sync_v3_client_for_inbound(conn, inbound_id, protocol, user_uuid, email, ts_ms)
 
         conn.commit()
         return inserted_ids
@@ -1055,9 +1412,17 @@ def delete_inbounds_db(db_path: str, inbound_ids: List[int], tags: List[str]) ->
     try:
         cursor = conn.cursor()
         if inbound_ids:
+            cleanup_v3_clients_for_inbounds(conn, inbound_ids)
             placeholders = ",".join(["?"] * len(inbound_ids))
             cursor.execute(f"DELETE FROM inbounds WHERE id IN ({placeholders})", inbound_ids)
         elif tags:
+            cursor.execute(
+                f"SELECT id FROM inbounds WHERE tag IN ({','.join(['?'] * len(tags))})",
+                tags,
+            )
+            resolved_ids = [int(row[0]) for row in cursor.fetchall()]
+            if resolved_ids:
+                cleanup_v3_clients_for_inbounds(conn, resolved_ids)
             placeholders = ",".join(["?"] * len(tags))
             cursor.execute(f"DELETE FROM inbounds WHERE tag IN ({placeholders})", tags)
         conn.commit()
@@ -1548,6 +1913,7 @@ def main() -> None:
     last_state = load_last_state()
 
     if mode == "show":
+        maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
         print_last_links()
         return
 
@@ -1580,6 +1946,7 @@ def main() -> None:
         if not os.path.exists(DB_PATH):
             exit_error(f"未找到 3x-ui 数据库: {DB_PATH}")
         normalize_existing_inbound_client_email(DB_PATH)
+        maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
     else:
         panel = setup_panel_client(runtime, interactive=False)
 
