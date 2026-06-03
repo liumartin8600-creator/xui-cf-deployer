@@ -813,13 +813,13 @@ def _read_nav_key() -> str:
                 if seq == "[D":
                     return "left"
                 continue
-            if ch in ("k", "K"):
+            if ch in ("k", "K", "w", "W"):
                 return "up"
-            if ch in ("j", "J"):
+            if ch in ("j", "J", "s", "S"):
                 return "down"
-            if ch in ("h", "H"):
+            if ch in ("h", "H", "a", "A"):
                 return "left"
-            if ch in ("l", "L"):
+            if ch in ("l", "L", "d", "D"):
                 return "right"
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -835,7 +835,7 @@ def _render_mode_menu(items: List[Tuple[str, str]], index: int, *, redraw: bool)
         sys.stdout.write(f"\033[{_mode_menu_line_count(items)}A")
 
     lines = [
-        "请选择模式 (↑↓←→ 移动, 回车确认):",
+        "请选择模式 (↑↓←→ / WASD / HJKL 移动, 回车确认):",
         "",
     ]
     for i, (_, label) in enumerate(items):
