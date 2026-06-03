@@ -2635,6 +2635,8 @@ def run_deploy_install() -> None:
         )
 
     headers = build_cf_headers(cf_email, cf_key)
+
+    zones = fetch_all_zones(headers)
     zone = find_best_zone(domain, zones)
     if zone is None:
         exit_error(f"无法匹配该域名对应的 Zone: {domain}")
