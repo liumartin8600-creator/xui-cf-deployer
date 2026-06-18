@@ -31,6 +31,8 @@ STATE_PATH = "/etc/x-ui/cf_auto_state.json"
 CF_ACCOUNT_PATH = "/etc/x-ui/cf_account.json"
 PANEL_INFO_PATH = "/etc/x-ui/cf_panel_access.json"
 LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_auto_last_links.txt")
+MULTI_STATE_PATH = "/etc/x-ui/cf_multi_state.json"
+MULTI_LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_multi_last_links.txt")
 PANEL_INFO_SNAPSHOT = os.path.join(os.getcwd(), "cf_panel_last_access.txt")
 CFD_BIN = "/usr/local/bin/cfd"
 DEPLOYER_INSTALL_PATH = "/usr/local/lib/cf-deployer/xui_cf_deployer.py"
@@ -735,6 +737,8 @@ def build_mode_menu_items() -> List[Tuple[str, str]]:
     if has_script_installed_panel():
         items.append(("panel", "查看面板"))
     if is_xui_installed():
+        items.append(("multi_install", "部署多个节点"))
+        items.append(("add_node", "增加节点"))
         items.append(("xui_manage", "面板管理命令"))
     return items
 
@@ -776,6 +780,15 @@ def parse_mode(raw: str, items: Optional[List[Tuple[str, str]]] = None) -> str:
         "panel": "panel",
         "面板": "panel",
         "查看面板": "panel",
+        "multi": "multi_install",
+        "multi_install": "multi_install",
+        "batch": "multi_install",
+        "部署多个节点": "multi_install",
+        "多节点": "multi_install",
+        "add": "add_node",
+        "add_node": "add_node",
+        "增加节点": "add_node",
+        "追加节点": "add_node",
         "xui": "xui_manage",
         "manage": "xui_manage",
         "管理": "xui_manage",
@@ -2585,6 +2598,266 @@ def uninstall_last_config(
     tags = [str(x) for x in state.get("tags", []) if str(x).strip()]
     delete_managed_inbounds(backend, inbound_ids, tags, panel=panel)
 
+def load_multi_state() -> Optional[Dict[str, Any]]:
+    if not os.path.exists(MULTI_STATE_PATH):
+        return None
+    try:
+        with open(MULTI_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        exit_error(f"读取多节点配置失败: {e}")
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def save_multi_state(state: Dict[str, Any]) -> None:
+    try:
+        with open(MULTI_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.chmod(MULTI_STATE_PATH, 0o600)
+    except OSError as e:
+        exit_error(f"保存多节点配置失败: {e}")
+
+
+def split_base_domain(domain: str) -> Tuple[str, str]:
+    cleaned = domain.strip().strip(".").lower()
+    parts = cleaned.split(".")
+    if len(parts) < 3:
+        exit_error("绑定域名至少应是三级域名，例如 cfdedirock.513300.xyz")
+    return parts[0], ".".join(parts[1:])
+
+
+def numbered_domain(base_domain: str, index: int) -> str:
+    prefix, suffix = split_base_domain(base_domain)
+    return f"{prefix}{index}.{suffix}"
+
+
+def prompt_positive_int(prompt: str) -> int:
+    raw = input(prompt).strip()
+    if not raw.isdigit() or int(raw) < 1:
+        exit_error("数量必须是大于 0 的整数")
+    return int(raw)
+
+
+def save_multi_links_snapshot(state: Dict[str, Any]) -> None:
+    nodes = state.get("nodes")
+    if not isinstance(nodes, list):
+        nodes = []
+    lines = [
+        "多节点订阅",
+        f"基础域名: {state.get('base_domain', '')}",
+        f"节点数量: {len(nodes)}",
+        "",
+    ]
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        domain = str(node.get("domain", "")).strip()
+        user_uuid = str(node.get("uuid", "")).strip()
+        links = node.get("links")
+        selected = node.get("selected_protocols") or state.get("selected_protocols") or PROTOCOL_ORDER
+        lines.append(f"域名: {domain}")
+        lines.append(f"UUID: {user_uuid}")
+        if isinstance(links, dict):
+            for protocol in selected:
+                p = str(protocol).lower()
+                if p in links:
+                    lines.append(f"{PROTOCOL_LABEL.get(p, p.upper())}订阅 {links[p]}")
+        lines.append("")
+    try:
+        with open(MULTI_LAST_LINKS_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        os.chmod(MULTI_LAST_LINKS_PATH, 0o600)
+    except OSError as e:
+        exit_error(f"保存多节点订阅失败: {e}")
+
+
+def load_existing_ports_for_backend(
+    backend: str,
+    panel: Optional[XuiPanelClient],
+) -> Set[int]:
+    if backend == BACKEND_API:
+        if panel is None:
+            exit_error("API 模式需要已登录的面板客户端")
+        return load_existing_ports_api(panel)
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            return load_existing_ports_db(conn)
+    except sqlite3.Error as e:
+        exit_error(str(e))
+
+
+def deploy_one_auto_domain(
+    *,
+    backend: str,
+    panel: Optional[XuiPanelClient],
+    headers: Dict[str, str],
+    zones: List[Dict[str, Any]],
+    public_ip: str,
+    selected_protocols: List[str],
+    domain: str,
+    existing_ports: Set[int],
+    node_index: int,
+) -> Dict[str, Any]:
+    user_uuid = str(uuid.uuid4())
+    short_id = user_uuid[:8]
+    ports = random_ports(len(selected_protocols), existing_ports)
+    existing_ports.update(ports)
+
+    routes = []
+    for i, protocol in enumerate(selected_protocols):
+        routes.append(
+            {
+                "protocol": protocol,
+                "port": ports[i],
+                "path": f"/{short_id}-{PROTOCOL_SUFFIX[protocol]}",
+            }
+        )
+
+    zone = find_best_zone(domain, zones)
+    if zone is None:
+        exit_error(f"无法匹配该域名对应的 Zone: {domain}")
+
+    zone_id = zone["id"]
+    dns_before = get_dns_record(zone_id, domain, headers)
+    ssl_before = get_ssl_mode(zone_id, headers)
+    origin_rules_before = get_origin_rules(zone_id, headers)
+
+    inbound_ids = create_inbounds(
+        backend,
+        user_uuid=user_uuid,
+        short_id=short_id,
+        routes=routes,
+        panel=panel,
+    )
+
+    managed_dns_record_id = upsert_dns_record(zone_id, domain, public_ip, headers)
+    set_ssl_mode(zone_id, headers, "flexible")
+    apply_origin_rules(zone_id, headers, domain, routes)
+
+    links = build_links(user_uuid, domain, routes)
+    state_version = 2 if backend == BACKEND_API else 1
+    return {
+        "version": state_version,
+        "backend": backend,
+        "node_index": node_index,
+        "domain": domain,
+        "zone_id": zone_id,
+        "uuid": user_uuid,
+        "short_id": short_id,
+        "routes": routes,
+        "inbound_ids": inbound_ids,
+        "tags": [f"{short_id}-{p}" for p in selected_protocols],
+        "managed_dns_record_id": managed_dns_record_id,
+        "dns_backup": {
+            "existed": dns_before is not None,
+            "record": dns_before,
+        },
+        "ssl_backup": ssl_before,
+        "origin_rules_backup": origin_rules_before,
+        "links": links,
+        "selected_protocols": selected_protocols,
+    }
+
+
+def run_deploy_multi(add_mode: bool = False) -> None:
+    if not is_xui_installed():
+        exit_error("未检测到 3x-ui，请先全新安装或使用已安装的 3x-ui")
+
+    multi_state = load_multi_state()
+
+    if add_mode:
+        if not multi_state:
+            exit_error("未检测到多节点配置，请先执行“部署多个节点”")
+        base_domain = str(multi_state.get("base_domain", "")).strip()
+        if not base_domain:
+            exit_error("多节点配置缺少 base_domain")
+        nodes = multi_state.get("nodes")
+        if not isinstance(nodes, list):
+            nodes = []
+        start_index = int(multi_state.get("next_index") or (len(nodes) + 1))
+        selected_protocols = [
+            str(p).lower()
+            for p in (multi_state.get("selected_protocols") or PROTOCOL_ORDER)
+            if str(p).lower() in PROTOCOL_ORDER
+        ]
+        if not selected_protocols:
+            selected_protocols = list(PROTOCOL_ORDER)
+        count = prompt_positive_int("增加节点数量: ")
+    else:
+        if multi_state:
+            exit_error("已检测到多节点配置，请使用“增加节点”，或先手动处理 /etc/x-ui/cf_multi_state.json")
+        base_domain = input("绑定域名基名(例如 cfdedirock.513300.xyz): ").strip()
+        if not base_domain:
+            exit_error("绑定域名不能为空")
+        count = prompt_positive_int("部署节点数量: ")
+        selected_protocols = parse_protocol_selection(
+            input("创建协议(1=vless,2=trojan,3=vmess，逗号分隔，留空=全部): ")
+        )
+        nodes = []
+        start_index = 1
+
+    backend, runtime, reason = resolve_backend(multi_state if add_mode else None)
+    print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
+
+    panel: Optional[XuiPanelClient] = None
+    if backend == BACKEND_DB:
+        if not os.path.exists(DB_PATH):
+            exit_error(f"未找到 3x-ui 数据库: {DB_PATH}")
+        normalize_existing_inbound_client_email(DB_PATH)
+        maybe_repair_v3_client_bindings(DB_PATH, "install", None)
+    else:
+        panel = setup_panel_client(runtime, interactive=False)
+
+    cf_email, cf_key = prompt_cf_credentials()
+    headers = build_cf_headers(cf_email, cf_key)
+    zones = fetch_all_zones(headers)
+    public_ip = get_public_ipv4()
+    existing_ports = load_existing_ports_for_backend(backend, panel)
+
+    if not add_mode:
+        multi_state = {
+            "version": 3,
+            "backend": backend,
+            "base_domain": base_domain,
+            "selected_protocols": selected_protocols,
+            "next_index": start_index,
+            "nodes": nodes,
+        }
+
+    end_index = start_index + count - 1
+    print(f"将部署域名: {numbered_domain(base_domain, start_index)} 到 {numbered_domain(base_domain, end_index)}")
+
+    for idx in range(start_index, end_index + 1):
+        domain = numbered_domain(base_domain, idx)
+        print(f"\n正在部署第 {idx} 个节点: {domain}")
+        node_state = deploy_one_auto_domain(
+            backend=backend,
+            panel=panel,
+            headers=headers,
+            zones=zones,
+            public_ip=public_ip,
+            selected_protocols=selected_protocols,
+            domain=domain,
+            existing_ports=existing_ports,
+            node_index=idx,
+        )
+        nodes.append(node_state)
+        multi_state["nodes"] = nodes
+        multi_state["next_index"] = idx + 1
+        multi_state["backend"] = backend
+        multi_state["selected_protocols"] = selected_protocols
+        save_multi_state(multi_state)
+        save_multi_links_snapshot(multi_state)
+
+        print(f"成功: {domain}")
+        for protocol in selected_protocols:
+            print(f"{PROTOCOL_LABEL[protocol]}订阅 {node_state['links'][protocol]}")
+
+    print(f"\n多节点部署完成，状态已保存到 {MULTI_STATE_PATH}")
+    print(f"订阅快照已保存到 {MULTI_LAST_LINKS_PATH}")
+
 
 def run_deploy_install() -> None:
     last_state = load_last_state()
@@ -2715,6 +2988,15 @@ def main() -> None:
     if mode == "xui_manage":
         print_xui_management_help()
         return
+
+    if mode == "multi_install":
+        run_deploy_multi(add_mode=False)
+        return
+
+    if mode == "add_node":
+        run_deploy_multi(add_mode=True)
+        return
+
 
     if mode == "show":
         maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
