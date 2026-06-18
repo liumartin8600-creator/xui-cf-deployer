@@ -2530,6 +2530,119 @@ def print_last_links() -> None:
     exit_error("未找到可查看的上次订阅")
 
 
+def read_optional_text(path: str) -> str:
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError as e:
+        exit_error(f"读取文件失败 {path}: {e}")
+
+
+def print_single_links_for_all_view() -> bool:
+    content = read_optional_text(LAST_LINKS_PATH)
+    if content:
+        print("========== 单节点订阅 ==========")
+        print(content)
+        print("")
+        return True
+
+    state = load_last_state()
+    if not state:
+        return False
+
+    links = state.get("links")
+    if isinstance(links, dict):
+        print("========== 单节点订阅 ==========")
+        domain = str(state.get("domain", "")).strip()
+        user_uuid = str(state.get("uuid", "")).strip()
+        if domain:
+            print(f"域名: {domain}")
+        if user_uuid:
+            print(f"UUID: {user_uuid}")
+        print("")
+
+        order = state.get("selected_protocols") or PROTOCOL_ORDER
+        printed = False
+        for protocol in order:
+            p = str(protocol).lower()
+            if p in links:
+                print(f"{PROTOCOL_LABEL.get(p, p.upper())}订阅 {links[p]}")
+                printed = True
+        if printed:
+            print("")
+            return True
+
+    return False
+
+
+def print_multi_links_for_all_view() -> bool:
+    content = read_optional_text(MULTI_LAST_LINKS_PATH)
+    if content:
+        print("========== 多节点订阅 ==========")
+        print(content)
+        print("")
+        return True
+
+    multi_state = load_multi_state()
+    if not multi_state:
+        return False
+
+    nodes = multi_state.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return False
+
+    print("========== 多节点订阅 ==========")
+    print(f"基础域名: {multi_state.get('base_domain', '')}")
+    print(f"节点数量: {len(nodes)}")
+    print("")
+
+    printed_any = False
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+
+        domain = str(node.get("domain", "")).strip()
+        user_uuid = str(node.get("uuid", "")).strip()
+        links = node.get("links")
+        selected = node.get("selected_protocols") or multi_state.get("selected_protocols") or PROTOCOL_ORDER
+
+        if not isinstance(links, dict):
+            continue
+
+        print(f"域名: {domain}")
+        print(f"UUID: {user_uuid}")
+        print("")
+
+        printed_node = False
+        for protocol in selected:
+            p = str(protocol).lower()
+            if p in links:
+                print(f"{PROTOCOL_LABEL.get(p, p.upper())}订阅 {links[p]}")
+                printed_node = True
+                printed_any = True
+
+        if printed_node:
+            print("")
+
+    return printed_any
+
+
+def print_all_links() -> None:
+    printed = False
+
+    if print_single_links_for_all_view():
+        printed = True
+
+    if print_multi_links_for_all_view():
+        printed = True
+
+    if not printed:
+        exit_error("未找到可查看的订阅")
+
+
 def restore_dns_record(
     zone_id: str,
     domain: str,
@@ -3160,7 +3273,7 @@ def main() -> None:
     
     if mode == "show":
         maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
-        print_last_links()
+        print_all_links()
         return
 
     if mode == "uninstall":
