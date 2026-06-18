@@ -739,6 +739,7 @@ def build_mode_menu_items() -> List[Tuple[str, str]]:
     if is_xui_installed():
         items.append(("multi_install", "部署多个节点"))
         items.append(("add_node", "增加节点"))
+        items.append(("multi_uninstall", "卸载多节点"))
         items.append(("xui_manage", "面板管理命令"))
     return items
 
@@ -789,6 +790,10 @@ def parse_mode(raw: str, items: Optional[List[Tuple[str, str]]] = None) -> str:
         "add_node": "add_node",
         "增加节点": "add_node",
         "追加节点": "add_node",
+        "multi_uninstall": "multi_uninstall",
+        "卸载多节点": "multi_uninstall",
+        "批量卸载": "multi_uninstall",
+        "选择卸载": "multi_uninstall",
         "xui": "xui_manage",
         "manage": "xui_manage",
         "管理": "xui_manage",
@@ -2858,6 +2863,157 @@ def run_deploy_multi(add_mode: bool = False) -> None:
     print(f"\n多节点部署完成，状态已保存到 {MULTI_STATE_PATH}")
     print(f"订阅快照已保存到 {MULTI_LAST_LINKS_PATH}")
 
+def parse_multi_uninstall_selection(raw: str, nodes: List[Dict[str, Any]]) -> List[int]:
+    text = raw.strip().lower()
+    if not text:
+        exit_error("未选择要卸载的节点")
+
+    if text in ("all", "a", "全部", "所有"):
+        return list(range(len(nodes)))
+
+    selected: Set[int] = set()
+    for token in text.replace("，", ",").replace(" ", "").split(","):
+        if not token:
+            continue
+        if not token.isdigit():
+            exit_error(f"无效选择: {token}")
+        idx = int(token)
+        if idx < 1 or idx > len(nodes):
+            exit_error(f"序号超出范围: {idx}")
+        selected.add(idx - 1)
+
+    if not selected:
+        exit_error("未选择要卸载的节点")
+    return sorted(selected)
+
+
+def uninstall_multi_node_config(
+    node_state: Dict[str, Any],
+    headers: Dict[str, str],
+    backend: str,
+    panel: Optional[XuiPanelClient] = None,
+) -> None:
+    domain = str(node_state.get("domain", "")).strip()
+    zone_id = str(node_state.get("zone_id", "")).strip()
+    if not domain or not zone_id:
+        exit_error("节点配置缺少 domain 或 zone_id，无法卸载")
+
+    current_rules = get_origin_rules(zone_id, headers)
+    put_origin_rules(zone_id, headers, strip_managed_origin_rules(current_rules, domain))
+
+    restore_dns_record(
+        zone_id=zone_id,
+        domain=domain,
+        headers=headers,
+        dns_backup=node_state.get("dns_backup"),
+        managed_dns_record_id=str(node_state.get("managed_dns_record_id", "")),
+    )
+
+    inbound_ids: List[int] = []
+    for item in node_state.get("inbound_ids", []):
+        try:
+            inbound_ids.append(int(item))
+        except Exception:
+            continue
+
+    tags = [str(x) for x in node_state.get("tags", []) if str(x).strip()]
+    delete_managed_inbounds(backend, inbound_ids, tags, panel=panel)
+
+
+def run_uninstall_multi() -> None:
+    multi_state = load_multi_state()
+    if not multi_state:
+        exit_error("未检测到多节点配置，无法卸载")
+
+    nodes = multi_state.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        exit_error("多节点配置为空，无法卸载")
+
+    print("当前多节点列表:")
+    for i, node in enumerate(nodes, 1):
+        if not isinstance(node, dict):
+            continue
+        domain = str(node.get("domain", "")).strip()
+        protocols = node.get("selected_protocols") or []
+        protocol_text = ",".join(str(p) for p in protocols) if protocols else "-"
+        print(f"  {i}. {domain} [{protocol_text}]")
+
+    raw = input("请输入要卸载的序号(例如 1 或 1,3；输入 all 卸载全部): ").strip()
+    selected_indexes = parse_multi_uninstall_selection(raw, nodes)
+
+    selected_domains = [
+        str(nodes[i].get("domain", "")).strip()
+        for i in selected_indexes
+        if isinstance(nodes[i], dict)
+    ]
+
+    print("即将卸载:")
+    for domain in selected_domains:
+        print(f"  - {domain}")
+
+    confirm = input("确认卸载? 输入 yes 继续: ").strip().lower()
+    if confirm != "yes":
+        exit_error("已取消卸载")
+
+    backend, runtime, reason = resolve_backend(multi_state)
+    print(f"x-ui 写入方式: {backend_label(backend)} ({reason})")
+
+    panel: Optional[XuiPanelClient] = None
+    if backend == BACKEND_API:
+        panel = setup_panel_client(runtime, interactive=False)
+
+    cf_email, cf_key = prompt_cf_credentials()
+    headers = build_cf_headers(cf_email, cf_key)
+
+    uninstall_all = len(selected_indexes) == len(nodes)
+
+    # 选择性卸载时不要恢复 Cloudflare SSL，因为 SSL 是整个 Zone 的全局设置，
+    # 否则可能影响剩余节点。
+    for i in sorted(selected_indexes, reverse=True):
+        node = nodes[i]
+        domain = str(node.get("domain", "")).strip()
+        print(f"\n正在卸载: {domain}")
+        uninstall_multi_node_config(node, headers, backend, panel=panel)
+        nodes.pop(i)
+        print(f"已卸载: {domain}")
+
+    if uninstall_all:
+        # 全部卸载时，才尝试恢复 Zone SSL 到最初备份值。
+        ssl_backup = str(multi_state.get("ssl_backup", "")).strip()
+        if not ssl_backup:
+            # 兼容旧状态：从第一个被卸载节点里取 ssl_backup
+            for node in multi_state.get("nodes", []):
+                if isinstance(node, dict) and str(node.get("ssl_backup", "")).strip():
+                    ssl_backup = str(node.get("ssl_backup", "")).strip()
+                    break
+
+        zone_id = ""
+        for node in multi_state.get("nodes", []):
+            if isinstance(node, dict) and str(node.get("zone_id", "")).strip():
+                zone_id = str(node.get("zone_id", "")).strip()
+                break
+
+        if ssl_backup and zone_id:
+            set_ssl_mode(zone_id, headers, ssl_backup)
+
+        try:
+            if os.path.exists(MULTI_STATE_PATH):
+                os.remove(MULTI_STATE_PATH)
+            if os.path.exists(MULTI_LAST_LINKS_PATH):
+                os.remove(MULTI_LAST_LINKS_PATH)
+        except OSError as e:
+            exit_error(f"删除多节点状态失败: {e}")
+
+        print("\n全部多节点已卸载")
+        return
+
+    multi_state["nodes"] = nodes
+    save_multi_state(multi_state)
+    save_multi_links_snapshot(multi_state)
+
+    print(f"\n已完成选择性卸载，剩余 {len(nodes)} 个节点")
+    print(f"多节点状态已更新: {MULTI_STATE_PATH}")
+
 
 def run_deploy_install() -> None:
     last_state = load_last_state()
@@ -2997,7 +3153,11 @@ def main() -> None:
         run_deploy_multi(add_mode=True)
         return
 
+    if mode == "multi_uninstall":
+        run_uninstall_multi()
+        return
 
+    
     if mode == "show":
         maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
         print_last_links()
